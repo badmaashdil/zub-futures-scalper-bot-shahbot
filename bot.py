@@ -1,4 +1,3 @@
-> Crypto:
 #!/usr/bin/env python3
 # Zub Bybit Futures Scalper Bot - MODE B (Aggressive + Safe)
 # Symbols: BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, DOGEUSDT
@@ -145,7 +144,7 @@ def can_open_new_position():
 
 # ============ MARKET DATA HELPERS ============
 
-> Crypto:
+
 def fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
     """Get recent kline for symbol and timeframe."""
     try:
@@ -273,7 +272,6 @@ def refresh_orderbook_http(symbol: str):
     except Exception as e:
         print(f"[ERROR] HTTP orderbook {symbol}:", e)
 
-> Crypto:
 def ob_ready(symbol: str) -> bool:
     ob = orderbook_data.get(symbol)
     if not ob:
