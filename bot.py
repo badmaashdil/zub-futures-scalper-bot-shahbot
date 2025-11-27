@@ -1,681 +1,940 @@
-#!/usr/bin/env python3
-# Zub Bybit Futures Scalper Bot - MODE B (Aggressive + Safe)
-# Symbols: BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, DOGEUSDT
-
-import os
 import time
 import json
+import logging
 import threading
-from datetime import datetime, timezone
+from collections import deque, defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, Any, Tuple, Optional, List
 
-import numpy as np
-import pandas as pd
-from dotenv import load_dotenv
-from pybit.unified_trading import HTTP
-import websocket
+import ccxt  # pip install ccxt
+import websocket  # pip install websocket-client
 
-# ================= CONFIG ===================
+# ===== CONFIG =====
 
+API_KEY = "0ZmKZEMHfNQL6oqHlM"
+API_SECRET = "X5WYuy3G82MR4gFTYLyj4ojFEybNSUWNznMw"
+
+# True = testnet, False = live
+TESTNET = False   # ⚠️ set carefully
+
+# Internal symbols (Bybit linear USDT perp) and ccxt mapping
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT"]
+CCXT_SYMBOL_MAP = {
+    "BTCUSDT": "BTC/USDT:USDT",
+    "ETHUSDT": "ETH/USDT:USDT",
+    "SOLUSDT": "SOL/USDT:USDT",
+    "BNBUSDT": "BNB/USDT:USDT",
+    "DOGEUSDT": "DOGE/USDT:USDT",
+}
 
-TF_5M = "5"      # scalping timeframe
-TF_15M = "15"    # confirmation timeframe
+PUBLIC_WS_MAINNET = "wss://stream.bybit.com/v5/public/linear"
+PUBLIC_WS_TESTNET = "wss://stream-testnet.bybit.com/v5/public/linear"
 
-LEVERAGE = 3
-EQUITY_FRACTION = 0.95     # 95% of equity per trade
+SCAN_INTERVAL = 5.0           # seconds between decision evaluations
+LEVERAGE = 3                  # fixed leverage
+MARGIN_FRACTION = 0.95        # 95% of equity per trade (compounding)
+TP_PCT_ON_POSITION = 0.01     # 1% TP
+SL_PCT_ON_POSITION = 0.005    # 0.5% SL
 
-TP_PERCENT = 1.0           # 1% TP
-SL_PERCENT = 0.5           # 0.5% SL
+MAX_DRAWDOWN_PCT = 0.10       # 10% equity loss -> bot stops
+MAX_CONCURRENT_POSITIONS = 1  # only 1 position at a time
 
-SCAN_INTERVAL = 20         # seconds between scans (Mode B = more trades than Mode A)
+POST_ONLY_TIMEOUT = 3.0       # wait for maker fill before taker
+VOL_MOVE_PCT_1S = 0.4 / 100.0
+VOL_MOVE_PCT_3S = 0.8 / 100.0
+IMBALANCE_LEVELS = 5
+IMBALANCE_THRESHOLD = 0.05    # ignore tiny imbalance
 
-MIN_VOLUME_USDT = 800_000  # min 5m quote volume
-IMB_THRESHOLD = 0.04       # min orderbook imbalance
-MAX_SPREAD_PCT = 0.0003    # 0.03% max spread
-
-RSI_5M_LONG = 52
-RSI_5M_SHORT = 48
-RSI_15M_LONG = 50
-RSI_15M_SHORT = 50
-
-MAX_DAILY_LOSS = 0.10      # 10% daily loss limit
-MAX_OPEN_POSITIONS = 1     # only 1 open position at a time
-
-MIN_REQUEST_INTERVAL = 0.20  # seconds between HTTP calls
-
-WS_URL = "wss://stream.bybit.com/v5/public/linear"
-
-# ============== GLOBAL STATE =================
-
-load_dotenv()
-
-API_KEY = os.getenv("BYBIT_API_KEY", "")
-API_SECRET = os.getenv("BYBIT_API_SECRET", "")
-
-client = HTTP(
-    api_key=API_KEY,
-    api_secret=API_SECRET,
-    testnet=False
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
-last_request_time = 0.0
-
-orderbook_data = {s: None for s in SYMBOLS}   # symbol -> {"bids": [...], "asks":[...]}
-open_positions = {}                           # symbol -> {side, size, entry}
-
-start_equity = None
-daily_loss = 0.0
-last_reset_date = datetime.now(timezone.utc).date()
-trading_paused = False
+logger = logging.getLogger("ws_scalper")
 
 
-# ============= COMMON UTILS =========================
-
-def rate_limited_request(func, *args, **kwargs):
-    """Basic rate limiter for Bybit HTTP."""
-    global last_request_time
-    now = time.time()
-    delta = now - last_request_time
-    if delta < MIN_REQUEST_INTERVAL:
-        time.sleep(MIN_REQUEST_INTERVAL - delta)
-    last_request_time = time.time()
-    return func(*args, **kwargs)
+def now_ts() -> float:
+    return time.time()
 
 
-def utc_date():
-    return datetime.now(timezone.utc).date()
+# ===== ExchangeClient using ccxt (REST for trading, balance, positions) =====
 
-
-def reset_daily_if_needed():
-    global daily_loss, last_reset_date, trading_paused, start_equity
-    today = utc_date()
-    if today != last_reset_date:
-        daily_loss = 0.0
-        last_reset_date = today
-        trading_paused = False
-        start_equity = None
-        print(f"[RESET] New trading day: {today}, daily loss reset.")
-
-
-def get_equity_usdt():
-    """Get unified account USDT equity."""
-    global start_equity
-    try:
-        res = rate_limited_request(
-            client.get_wallet_balance,
-            accountType="UNIFIED"
-        )
-        coins = res["result"]["list"][0]["coin"]
-        usdt = next((c for c in coins if c["coin"] == "USDT"), None)
-        if not usdt:
-            return 0.0
-        eq = float(usdt["equity"])
-        if start_equity is None:
-            start_equity = eq
-        return eq
-    except Exception as e:
-        print("[ERROR] equity error:", e)
-        return 0.0
-
-
-def update_daily_loss():
-    global daily_loss, trading_paused
-    if start_equity is None:
-        return
-    current = get_equity_usdt()
-    if current <= 0:
-        return
-    loss = max(0.0, (start_equity - current) / start_equity)
-    daily_loss = loss
-    if daily_loss >= MAX_DAILY_LOSS:
-        trading_paused = True
-        print(f"[RISK] Daily loss {daily_loss:.2%} >= {MAX_DAILY_LOSS:.0%}. Trading PAUSED.")
-
-
-def can_open_new_position():
-    if trading_paused:
-        print("[SKIP] Trading paused due to daily loss.")
-        return False
-    if len(open_positions) >= MAX_OPEN_POSITIONS:
-        print("[SKIP] Max open positions reached.")
-        return False
-    return True
-
-
-# ============ MARKET DATA HELPERS ============
-
-
-def fetch_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-    """Get recent kline for symbol and timeframe."""
-    try:
-        res = rate_limited_request(
-            client.get_kline,
-            category="linear",
-            symbol=symbol,
-            interval=interval,
-            limit=limit
-        )
-        rows = res["result"]["list"]
-        rows = rows[::-1]  # newest last
-        data = []
-        for r in rows:
-            data.append(
-                {
-                    "open_time": int(r[0]),
-                    "open": float(r[1]),
-                    "high": float(r[2]),
-                    "low": float(r[3]),
-                    "close": float(r[4]),
-                    "volume": float(r[5]),
-                    "turnover": float(r[6])
+class ExchangeClient:
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = True):
+        self.lock = threading.Lock()
+        options: Dict[str, Any] = {
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+            "options": {
+                "defaultType": "swap",  # USDT futures
+            },
+        }
+        if testnet:
+            options["urls"] = {
+                "api": {
+                    "public": "https://api-testnet.bybit.com",
+                    "private": "https://api-testnet.bybit.com",
                 }
+            }
+        self.client = ccxt.bybit(options)
+
+    def _ccxt_symbol(self, symbol: str) -> str:
+        return CCXT_SYMBOL_MAP[symbol]
+
+    def get_balance(self) -> float:
+        with self.lock:
+            bal = self.client.fetch_balance()
+        usdt = bal.get("USDT") or {}
+        total = usdt.get("total")
+        if total is None:
+            return float(bal.get("total", {}).get("USDT", 0.0))
+        return float(total)
+
+    def set_leverage(self, symbol: str, leverage: int) -> None:
+        ccxt_symbol = self._ccxt_symbol(symbol)
+        with self.lock:
+            try:
+                self.client.set_leverage(leverage, ccxt_symbol)
+            except Exception as e:
+                logger.warning(f"{symbol}: set_leverage error: {e}")
+
+    def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
+        ccxt_symbol = self._ccxt_symbol(symbol)
+        with self.lock:
+            try:
+                positions = self.client.fetch_positions([ccxt_symbol])
+            except Exception as e:
+                logger.warning(f"{symbol}: fetch_positions error: {e}")
+                return None
+        for p in positions:
+            size = float(p.get("contracts") or p.get("size") or 0.0)
+            if size != 0:
+                return p
+        return None
+
+    def place_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        price: float,
+        qty: float,
+        reduce_only: bool = False,
+        post_only: bool = True,
+    ) -> Dict[str, Any]:
+        ccxt_symbol = self._ccxt_symbol(symbol)
+        params: Dict[str, Any] = {}
+        if reduce_only:
+            params["reduce_only"] = True
+        if post_only:
+            params["timeInForce"] = "PostOnly"
+        with self.lock:
+            order = self.client.create_order(
+                symbol=ccxt_symbol,
+                type="limit",
+                side=side.lower(),
+                amount=qty,
+                price=price,
+                params=params,
             )
-        df = pd.DataFrame(data)
-        return df
-    except Exception as e:
-        print(f"[ERROR] fetch_klines {symbol} {interval}m:", e)
-        return pd.DataFrame()
+        return order
+
+    def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        reduce_only: bool = False,
+    ) -> Dict[str, Any]:
+        ccxt_symbol = self._ccxt_symbol(symbol)
+        params: Dict[str, Any] = {}
+        if reduce_only:
+            params["reduce_only"] = True
+        with self.lock:
+            order = self.client.create_order(
+                symbol=ccxt_symbol,
+                type="market",
+                side=side.lower(),
+                amount=qty,
+                params=params,
+            )
+        return order
+
+    def place_stop_market_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        stop_price: float,
+        reduce_only: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Stop-market order (SL). Using stopLossPrice param that ccxt maps for Bybit.
+        """
+        ccxt_symbol = self._ccxt_symbol(symbol)
+        params: Dict[str, Any] = {
+            "stopLossPrice": stop_price,
+            "reduce_only": reduce_only,
+        }
+        with self.lock:
+            order = self.client.create_order(
+                symbol=ccxt_symbol,
+                type="market",
+                side=side.lower(),
+                amount=qty,
+                params=params,
+            )
+        return order
+
+    def cancel_order(self, symbol: str, order_id: str) -> bool:
+        ccxt_symbol = self._ccxt_symbol(symbol)
+        with self.lock:
+            try:
+                self.client.cancel_order(order_id, ccxt_symbol)
+                return True
+            except Exception as e:
+                logger.warning(f"{symbol}: cancel_order error: {e}")
+                return False
+
+    def get_order_status(self, symbol: str, order_id: Optional[str]) -> Dict[str, Any]:
+        if not order_id:
+            return {}
+        ccxt_symbol = self._ccxt_symbol(symbol)
+        with self.lock:
+            try:
+                o = self.client.fetch_order(order_id, ccxt_symbol)
+            except Exception as e:
+                logger.warning(f"{symbol}: fetch_order error: {e}")
+                return {}
+        status = (o.get("status") or "").lower()
+        return {
+            "status": status,  # 'open', 'closed', 'canceled'
+            "avg_price": o.get("average") or o.get("price"),
+        }
+
+    def close_position_market(self, symbol: str) -> None:
+        pos = self.get_position(symbol)
+        if not pos:
+            return
+        ccxt_symbol = self._ccxt_symbol(symbol)
+        size = float(pos.get("contracts") or pos.get("size") or 0.0)
+        if size == 0:
+            return
+        side = (pos.get("side") or "").lower()  # 'long' or 'short'
+        close_side = "sell" if side == "long" else "buy"
+        params = {"reduce_only": True}
+        with self.lock:
+            try:
+                self.client.create_order(
+                    symbol=ccxt_symbol,
+                    type="market",
+                    side=close_side,
+                    amount=abs(size),
+                    params=params,
+                )
+            except Exception as e:
+                logger.error(f"{symbol}: close_position_market error: {e}")
 
 
-def calc_rsi(close_arr, period: int = 14) -> float:
-    """Simple RSI calculation."""
-    if len(close_arr) < period + 1:
-        return 50.0
-    delta = np.diff(close_arr)
-    gain = np.maximum(delta, 0)
-    loss = -np.minimum(delta, 0)
-    gain_ema = pd.Series(gain).ewm(alpha=1/period, adjust=False).mean()
-    loss_ema = pd.Series(loss).ewm(alpha=1/period, adjust=False).mean()
-    rs = gain_ema / (loss_ema + 1e-9)
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1])
+# ===== Detectors & filters =====
+
+class SpoofDetector:
+    def __init__(self, cancel_window: float = 1.0, repeat_count: int = 3):
+        self.cancel_window = cancel_window
+        self.repeat_count = repeat_count
+        self.recent_orders: Dict[Tuple[str, float], deque] = defaultdict(deque)
+
+    def on_order_event(self, side: str, price: float, event_type: str, ts: Optional[float] = None) -> None:
+        ts = ts or now_ts()
+        key = (side, float(price))
+        dq = self.recent_orders[key]
+        dq.append((event_type, ts))
+        while dq and ts - dq[0][1] > self.cancel_window:
+            dq.popleft()
+
+    def is_spoof(self, side: str, price: float) -> Tuple[bool, float]:
+        key = (side, float(price))
+        dq = self.recent_orders.get(key, deque())
+        cancels = sum(1 for ev, _ in dq if ev == "cancel")
+        if cancels >= self.repeat_count:
+            conf = min(1.0, cancels / float(self.repeat_count))
+            return True, conf
+        return False, 0.0
 
 
-def add_indicators_5m(df: pd.DataFrame) -> pd.DataFrame:
-    """Add EMA, volume, VWAP and RSI to 5m dataframe."""
-    if df.empty:
-        return df
+class WhaleCancelDetector:
+    def __init__(self, size_threshold: float, window_sec: float = 5.0):
+        self.size_threshold = size_threshold
+        self.window = window_sec
+        self.large_orders: Dict[float, deque] = defaultdict(deque)
 
-    df["ema_fast"] = df["close"].ewm(span=20).mean()
-    df["ema_slow"] = df["close"].ewm(span=50).mean()
-    df["quote_vol"] = df["turnover"]
+    def on_order_event(self, price: float, size: float, event_type: str, ts: Optional[float] = None) -> None:
+        ts = ts or now_ts()
+        if size < self.size_threshold:
+            return
+        dq = self.large_orders[float(price)]
+        dq.append((event_type, ts, size))
+        while dq and ts - dq[0][1] > self.window:
+            dq.popleft()
 
-    # VWAP: typical price * volume
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    vol = df["volume"]
-    df["vwap"] = (tp * vol).cumsum() / (vol.cumsum() + 1e-9)
-
-    closes = df["close"].values
-    df["rsi"] = np.nan
-    if len(closes) > 20:
-        r = calc_rsi(closes, period=14)
-        df.loc[df.index[-1], "rsi"] = r
-
-    return df
-
-
-def volatility_ok(df_5m: pd.DataFrame) -> bool:
-    """Filter too violent or too dead moves (5m)."""
-    try:
-        if df_5m.empty or len(df_5m) < 3:
-            return False
-        c1 = df_5m["close"].iloc[-1]
-        c0 = df_5m["close"].iloc[-2]
-        move_pct = abs(c1 - c0) / c0
-
-        # Mode B: a bit looser than A
-        if move_pct > 0.02:   # > 2% in 5m → crazy news
-            print(f"[VOL] Too violent move {move_pct:.2%}")
-            return False
-        if move_pct < 0.0005:  # < 0.05% → dead
-            print(f"[VOL] Too dead move {move_pct:.2%}")
-            return False
-        return True
-    except Exception as e:
-        print("[ERROR] volatility check:", e)
-        return False
-
-
-def volume_ok(df_5m: pd.DataFrame) -> bool:
-    """Check last candle quote volume."""
-    try:
-        if df_5m.empty:
-            return False
-        v = df_5m["quote_vol"].iloc[-1]
-        avg = df_5m["quote_vol"].tail(30).mean()
-        if v < MIN_VOLUME_USDT:
-            print(f"[VOL] Last vol {v:.0f} < {MIN_VOLUME_USDT}")
-            return False
-        if v < avg * 0.5:
-            print(f"[VOL] Last vol {v:.0f} < 50% of avg {avg:.0f}")
-            return False
-        return True
-    except Exception as e:
-        print("[ERROR] volume check:", e)
-        return False
-
-
-# ============ ORDERBOOK FILTERS (L2) ============
-
-def refresh_orderbook_http(symbol: str):
-    """HTTP snapshot (fallback if WS not ready)."""
-    try:
-        res = rate_limited_request(
-            client.get_orderbook,
-            category="linear",
-            symbol=symbol,
-            limit=50
-        )
-        bids = res["result"]["b"]
-        asks = res["result"]["a"]
-        orderbook_data[symbol] = {"bids": bids, "asks": asks}
-    except Exception as e:
-        print(f"[ERROR] HTTP orderbook {symbol}:", e)
-
-def ob_ready(symbol: str) -> bool:
-    ob = orderbook_data.get(symbol)
-    if not ob:
-        return False
-    if not ob.get("bids") or not ob.get("asks"):
-        return False
-    return True
-
-
-def orderbook_imbalance(symbol: str) -> float:
-    try:
-        ob = orderbook_data.get(symbol)
-        if not ob:
-            return 0.0
-        bids = ob["bids"][:15]
-        asks = ob["asks"][:15]
-        bid_vol = sum(float(b[1]) for b in bids)
-        ask_vol = sum(float(a[1]) for a in asks)
-        total = bid_vol + ask_vol
+    def is_whale_cancelling(self, price: float) -> Tuple[bool, float]:
+        dq = self.large_orders.get(float(price), deque())
+        if not dq:
+            return False, 0.0
+        cancels = sum(1 for t, _, _ in dq if t == "cancel")
+        adds = sum(1 for t, _, _ in dq if t == "new")
+        total = cancels + adds
         if total == 0:
-            return 0.0
-        return (bid_vol - ask_vol) / total
-    except Exception as e:
-        print("[ERROR] imbalance:", e)
+            return False, 0.0
+        cancel_rate = cancels / float(total)
+        if cancel_rate > 0.3 and total >= 2:
+            return True, cancel_rate
+        return False, cancel_rate
+
+
+def compute_imbalance(book: Dict[str, Dict[float, float]], levels: int = 5) -> float:
+    bids = sorted(book.get("bids", {}).items(), key=lambda x: -x[0])[:levels]
+    asks = sorted(book.get("asks", {}).items(), key=lambda x: x[0])[:levels]
+    bid_vol = sum(q for _, q in bids)
+    ask_vol = sum(q for _, q in asks)
+    total = bid_vol + ask_vol
+    if total == 0:
         return 0.0
+    return (bid_vol - ask_vol) / float(total)
 
 
-def ob_spread_ok(symbol: str) -> bool:
-    try:
-        ob = orderbook_data.get(symbol)
-        if not ob:
-            return True
-        best_bid = float(ob["bids"][0][0])
-        best_ask = float(ob["asks"][0][0])
-        mid = (best_bid + best_ask) / 2
-        spread = (best_ask - best_bid) / mid
-        if spread > MAX_SPREAD_PCT:
-            print(f"[SPREAD] {symbol} spread {spread:.4%} too wide")
-            return False
-        return True
-    except Exception as e:
-        print("[ERROR] spread:", e)
-        return True
+def compute_short_term_cvd(trades: List[Dict[str, Any]]) -> float:
+    cvd = 0.0
+    for t in trades:
+        size = float(t.get("size", 0.0))
+        side = str(t.get("side", "")).lower()
+        if side == "buy":
+            cvd += size
+        elif side == "sell":
+            cvd -= size
+    return cvd
 
 
-def detect_spoof(symbol: str):
-    """Detect spoof buy/sell walls."""
-    ob = orderbook_data.get(symbol)
-    if not ob:
-        return (False, False)
-    try:
-        bids = ob["bids"][:10]
-        asks = ob["asks"][:10]
-        if not bids or not asks:
-            return (False, False)
-        bid_sizes = [float(b[1]) for b in bids]
-        ask_sizes = [float(a[1]) for a in asks]
-        max_bid = max(bid_sizes)
-        max_ask = max(ask_sizes)
-        avg_bid = sum(bid_sizes) / len(bid_sizes)
-        avg_ask = sum(ask_sizes) / len(ask_sizes)
-        mul = 3.0
-        spoof_buy = max_bid > avg_bid * mul
-        spoof_sell = max_ask > avg_ask * mul
-        if spoof_buy:
-            print("🟩 SPOOF BUY WALL")
-        if spoof_sell:
-            print("🟥 SPOOF SELL WALL")
-        return (spoof_buy, spoof_sell)
-    except Exception as e:
-        print("[ERROR] spoof:", e)
-        return (False, False)
+def compute_delta_burst(trades: List[Dict[str, Any]], last_n: int = 30) -> float:
+    burst = 0.0
+    for t in trades[-last_n:]:
+        size = float(t.get("size", 0.0))
+        side = str(t.get("side", "")).lower()
+        if side == "buy":
+            burst += size
+        elif side == "sell":
+            burst -= size
+    return burst
 
 
-def hidden_liq(symbol: str) -> bool:
-    """Simple iceberg-like detection."""
-    ob = orderbook_data.get(symbol)
-    if not ob:
-        return False
-    try:
-        bids = ob["bids"]
-        asks = ob["asks"]
-        if len(bids) < 2 or len(asks) < 2:
-            return False
-        refill_buy = float(bids[0][1]) > float(bids[1][1]) * 3
-        refill_sell = float(asks[0][1]) > float(asks[1][1]) * 3
-        return refill_buy or refill_sell
-    except Exception:
-        return False
-
-
-# ============ BTC TREND FILTER ============
-
-def btc_trend_up() -> bool | None:
-    """BTC 15m trend filter via EMA."""
-    df = fetch_klines("BTCUSDT", TF_15M, limit=120)
-    if df.empty:
-        return None
-    df = add_indicators_5m(df)  # reuse EMA logic
-    fast = df["ema_fast"].iloc[-1]
-    slow = df["ema_slow"].iloc[-1]
-    return fast > slow
-
-
-# ============ SIGNAL ENGINE (MODE B) ============
-
-def decide_direction(symbol: str) -> str | None:
-    """
-    MODE B decision:
-    - 5m EMA trend
-    - 5m & 15m RSI
-    - Volume filter
-    - Volatility filter
-    - Orderbook imbalance
-    - Spread quality
-    - Spoof + Hidden liquidity
-    - BTC global trend guard
-    Returns: "long", "short" or None
-    """
-
-    if not ob_ready(symbol):
-        print(f"[OB] {symbol} WS not ready, HTTP snapshot.")
-        refresh_orderbook_http(symbol)
-
-    # 5m data
-    df5 = fetch_klines(symbol, TF_5M, limit=120)
-    if df5.empty:
-        return None
-    df5 = add_indicators_5m(df5)
-
-    if not volatility_ok(df5):
-        return None
-    if not volume_ok(df5):
-        return None
-    if not ob_spread_ok(symbol):
-        return None
-
-    rsi5 = df5["rsi"].iloc[-1]
-    ema_fast = df5["ema_fast"].iloc[-1]
-    ema_slow = df5["ema_slow"].iloc[-1]
-    vwap = df5["vwap"].iloc[-1]
-    last_close = df5["close"].iloc[-1]
-
-    if np.isnan(rsi5):
-        return None
-
-    trend_up = ema_fast > ema_slow
-    trend_down = ema_fast < ema_slow
-
-> Crypto:
-# 15m RSI confirmation
-    df15 = fetch_klines(symbol, TF_15M, limit=120)
-    if df15.empty:
-        return None
-    closes15 = df15["close"].values
-    rsi15 = calc_rsi(closes15, period=14)
-
-    # Orderbook filters
-    imb = orderbook_imbalance(symbol)
-    spoof_buy, spoof_sell = detect_spoof(symbol)
-    ice = hidden_liq(symbol)
-
-    # BTC trend guard
-    btc_up = btc_trend_up()
-
-    print(
-        f"{symbol} | close={last_close:.2f} rsi5={rsi5:.1f} rsi15={rsi15:.1f} "
-        f"trend_up={trend_up} imb={imb:.3f} spoofB={spoof_buy} spoofS={spoof_sell} "
-        f"ice={ice} btc_up={btc_up}"
-    )
-
-    direction = None
-
-    # LONG conditions
-    if (
-        trend_up
-        and last_close > vwap
-        and rsi5 >= RSI_5M_LONG
-        and rsi15 >= RSI_15M_LONG
-        and imb >= IMB_THRESHOLD
-        and (spoof_buy or ice)
-    ):
-        direction = "long"
-
-    # SHORT conditions
-    if (
-        trend_down
-        and last_close < vwap
-        and rsi5 <= RSI_5M_SHORT
-        and rsi15 <= RSI_15M_SHORT
-        and imb <= -IMB_THRESHOLD
-        and (spoof_sell or ice)
-    ):
-        # If both long & short trigger (super rare) → skip
-        if direction == "long":
-            direction = None
-        else:
-            direction = "short"
-
-    # BTC guard – follow master trend
-    if direction == "long" and btc_up is False:
-        return None
-    if direction == "short" and btc_up is True:
-        return None
-
-    return direction
-
-
-# ============ POSITION & ORDER EXECUTION ============
-
-def refresh_positions():
-    """Refresh open positions from Bybit."""
-    global open_positions
-    try:
-        res = rate_limited_request(
-            client.get_positions,
-            category="linear"
-        )
-        items = res["result"]["list"]
-        active = {}
-        for p in items:
-            sz = float(p["size"])
-            if sz == 0:
-                continue
-            sym = p["symbol"]
-            side = p["side"]  # "Buy" or "Sell"
-            entry = float(p["avgPrice"])
-            active[sym] = {"side": side, "size": sz, "entry": entry}
-        open_positions = active
-    except Exception as e:
-        print("[ERROR] refresh_positions:", e)
-
-
-def calc_order_size(symbol: str, price: float) -> float:
-    eq = get_equity_usdt()
-    if eq <= 0 or price <= 0:
+def compute_ema_slope_5m(candles_5m: List[Dict[str, float]]) -> float:
+    if len(candles_5m) < 20:
         return 0.0
-    notional = eq * EQUITY_FRACTION * LEVERAGE
-    qty = notional / price
-    return round(qty, 3)
+    closes = [float(c["close"]) for c in candles_5m][-20:]
+    ema_fast = sum(closes[-5:]) / 5.0
+    ema_slow = sum(closes) / len(closes)
+    if ema_slow == 0:
+        return 0.0
+    return (ema_fast - ema_slow) / ema_slow
 
 
-def place_bracket_order(symbol: str, direction: str, price: float):
-    global open_positions
-
-    side = "Buy" if direction == "long" else "Sell"
-    qty = calc_order_size(symbol, price)
-    if qty <= 0:
-        print("[ORDER] size <= 0, abort.")
-        return
-
-    if direction == "long":
-        tp_price = price * (1 + TP_PERCENT / 100.0)
-        sl_price = price * (1 - SL_PERCENT / 100.0)
+def compute_volume_range_flags(candles_1m: List[Dict[str, float]], lookback: int = 20) -> Tuple[bool, bool]:
+    if len(candles_1m) < lookback + 1:
+        return True, True
+    recent = candles_1m[-(lookback + 1):-1]
+    last = candles_1m[-1]
+    avg_vol = sum(float(c.get("volume", 0.0)) for c in recent) / float(len(recent) or 1)
+    last_vol = float(last.get("volume", 0.0))
+    volume_ok = last_vol >= 0.5 * avg_vol if avg_vol > 0 else True
+    last_high = float(last["high"])
+    last_low = float(last["low"])
+    last_close = float(last["close"])
+    rng = last_high - last_low
+    if last_close <= 0:
+        range_ok = True
     else:
-        tp_price = price * (1 - TP_PERCENT / 100.0)
-        sl_price = price * (1 + SL_PERCENT / 100.0)
+        range_ok = (rng / last_close) >= 0.002
+    return volume_ok, range_ok
 
-    print(
-        f"[ORDER] {symbol} {direction.upper()} size={qty} "
-        f"entry={price:.2f} TP={tp_price:.2f} SL={sl_price:.2f}"
-    )
 
-    try:
-        rate_limited_request(
-            client.set_leverage,
-            category="linear",
-            symbol=symbol,
-            buyLeverage=str(LEVERAGE),
-            sellLeverage=str(LEVERAGE),
+def check_unpredictable(recent_price_changes: List[Tuple[float, float]]) -> bool:
+    if len(recent_price_changes) < 2:
+        return False
+    now_t, now_p = recent_price_changes[-1]
+    p_1s = None
+    p_3s = None
+    for ts, p in reversed(recent_price_changes):
+        dt = now_t - ts
+        if p_1s is None and dt >= 1.0:
+            p_1s = p
+        if p_3s is None and dt >= 3.0:
+            p_3s = p
+        if p_1s and p_3s:
+            break
+    if p_1s:
+        move1 = abs(now_p - p_1s) / p_1s
+        if move1 >= VOL_MOVE_PCT_1S:
+            return True
+    if p_3s:
+        move3 = abs(now_p - p_3s) / p_3s
+        if move3 >= VOL_MOVE_PCT_3S:
+            return True
+    return False
+
+
+# ===== Risk & position sizing =====
+
+@dataclass
+class Position:
+    symbol: str
+    side: str   # "Buy" or "Sell"
+    qty: float
+    entry_price: float
+    tp_price: float
+    sl_price: float
+    notional: float
+    ts_open: float = field(default_factory=now_ts)
+
+
+class RiskManager:
+    def __init__(self, max_drawdown_pct: float):
+        self.max_drawdown_pct = max_drawdown_pct
+        self.start_equity: Optional[float] = None
+
+    def update_and_check(self, equity: float) -> bool:
+        if self.start_equity is None:
+            self.start_equity = equity
+            logger.info(f"Starting equity recorded: {equity:.4f}")
+        if equity <= self.start_equity * (1.0 - self.max_drawdown_pct):
+            logger.error(
+                f"Max drawdown hit! Equity={equity:.4f}, Start={self.start_equity:.4f}, "
+                f"DD={self.max_drawdown_pct*100:.1f}% -> stopping bot"
+            )
+            return False
+        return True
+
+
+def compute_position_and_prices(
+    equity_usd: float,
+    entry_price: float,
+    side: str,
+) -> Tuple[float, float, float, float]:
+    if equity_usd <= 0 or entry_price <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+    position_notional = equity_usd * MARGIN_FRACTION * LEVERAGE
+    qty = position_notional / entry_price
+    qty = float(f"{qty:.6f}")
+    tp_frac = TP_PCT_ON_POSITION
+    sl_frac = SL_PCT_ON_POSITION
+    if side.lower() in ("buy", "long"):
+        tp_price = entry_price * (1.0 + tp_frac)
+        sl_price = entry_price * (1.0 - sl_frac)
+    else:
+        tp_price = entry_price * (1.0 - tp_frac)
+        sl_price = entry_price * (1.0 + sl_frac)
+    return qty, position_notional, tp_price, sl_price
+
+
+# ===== Decision Engine =====
+
+class DecisionEngine:
+    def __init__(self, exchange: ExchangeClient, symbols: List[str]):
+        self.exchange = exchange
+        self.symbols = symbols
+        self.spoof = SpoofDetector()
+        self.whale = {s: WhaleCancelDetector(size_threshold=1.0) for s in symbols}
+        self.open_positions: Dict[str, Position] = {}
+        self.pause_until = 0.0
+        self.risk = RiskManager(MAX_DRAWDOWN_PCT)
+        self.btc_blocked = False
+        self.lock = threading.Lock()
+
+    def set_pause(self, seconds: float) -> None:
+        self.pause_until = now_ts() + seconds
+        logger.warning(f"Bot paused for {seconds:.1f}s (until {self.pause_until:.0f})")
+
+    def is_paused(self) -> bool:
+        return now_ts() < self.pause_until
+
+    def evaluate_symbol(
+        self,
+        symbol: str,
+        book: Dict[str, Dict[float, float]],
+        trades: List[Dict[str, Any]],
+        candles_5m: List[Dict[str, float]],
+        candles_1m: List[Dict[str, float]],
+        recent_prices: List[Tuple[float, float]],
+    ) -> None:
+        with self.lock:
+            self._evaluate_locked(symbol, book, trades, candles_5m, candles_1m, recent_prices)
+
+    def _evaluate_locked(
+        self,
+        symbol: str,
+        book: Dict[str, Dict[float, float]],
+        trades: List[Dict[str, Any]],
+        candles_5m: List[Dict[str, float]],
+        candles_1m: List[Dict[str, float]],
+        recent_prices: List[Tuple[float, float]],
+    ) -> None:
+        # equity & drawdown
+        equity = self.exchange.get_balance()
+        if not self.risk.update_and_check(equity):
+            self.set_pause(3600.0)
+            return
+
+        if self.is_paused():
+            return
+
+        # unpredictable volatility
+        if check_unpredictable(recent_prices):
+            logger.warning(f"{symbol}: unpredictable 1s/3s move -> pause")
+            self.set_pause(5.0)
+            return
+
+        # BTC master trend filter placeholder (you can later wire BTC logic)
+        if symbol != "BTCUSDT" and self.btc_blocked:
+            logger.info(f"{symbol}: blocked by BTC filter")
+            return
+
+        # volume & range
+        volume_ok, range_ok = compute_volume_range_flags(candles_1m)
+        if not volume_ok or not range_ok:
+            logger.debug(f"{symbol}: volume/range filter -> skip")
+            return
+
+        # trend / RSI placeholders
+        ema_slope = compute_ema_slope_5m(candles_5m)
+        rsi_5m = 50.0           # later you can compute real RSI
+        trend_15m = 0           # later HTF trend
+
+        if abs(ema_slope) < 0.01:
+            logger.debug(f"{symbol}: flat EMA slope {ema_slope:.4f} -> skip")
+            return
+
+        avoid_longs = rsi_5m > 80
+        avoid_shorts = rsi_5m < 20
+
+        # orderbook imbalance
+        imb = compute_imbalance(book, levels=IMBALANCE_LEVELS)
+        if abs(imb) < IMBALANCE_THRESHOLD:
+            logger.debug(f"{symbol}: small imbalance {imb:.3f} -> skip")
+            return
+
+        bids = book.get("bids", {})
+        asks = book.get("asks", {})
+        if not bids or not asks:
+            return
+        best_bid = max(bids)
+        best_ask = min(asks)
+
+        # spoof / whale checks at top levels
+        spf_bid, _ = self.spoof.is_spoof("bid", best_bid)
+        if spf_bid:
+            logger.info(f"{symbol}: spoof on bid {best_bid} -> skip")
+            return
+        wc_flag_bid, _ = self.whale[symbol].is_whale_cancelling(best_bid)
+        if wc_flag_bid:
+            logger.info(f"{symbol}: whale cancelling bids -> skip")
+            return
+        spf_ask, _ = self.spoof.is_spoof("ask", best_ask)
+        if spf_ask:
+            logger.info(f"{symbol}: spoof on ask {best_ask} -> skip")
+            return
+
+        # orderflow
+        short_cvd = compute_short_term_cvd(trades)
+        delta_burst = compute_delta_burst(trades)
+        if short_cvd > 0 and delta_burst > 0:
+            of_score = 1.0
+        elif short_cvd < 0 and delta_burst < 0:
+            of_score = -1.0
+        else:
+            of_score = 0.0
+
+        # composite score
+        trend_score = max(-1.0, min(1.0, ema_slope * 20.0))
+        imb_score = max(-1.0, min(1.0, imb * 5.0))
+        final_score = trend_score * 0.4 + imb_score * 0.3 + of_score * 0.3
+
+        decision: Optional[str] = None
+        reason = f"trend={trend_score:.2f} imb={imb_score:.2f} of={of_score:.2f}"
+
+        if final_score >= 0.6 and not avoid_longs and trend_15m >= 0:
+            decision = "LONG"
+        elif final_score <= -0.6 and not avoid_shorts and trend_15m <= 0:
+            decision = "SHORT"
+        else:
+            logger.debug(f"{symbol}: no strong signal score={final_score:.2f} ({reason})")
+            return
+
+        # global concurrency
+        if len(self.open_positions) >= MAX_CONCURRENT_POSITIONS:
+            logger.info(f"{symbol}: max positions open -> skip")
+            return
+
+        # position sizing
+        side_for_calc = "buy" if decision == "LONG" else "sell"
+        mid_price = (best_bid + best_ask) / 2.0
+        qty, notional, tp_price, sl_price = compute_position_and_prices(
+            equity_usd=equity,
+            entry_price=mid_price,
+            side=side_for_calc,
         )
-    except Exception as e:
-        print("[ERROR] set_leverage:", e)
+        if qty <= 0 or notional <= 0:
+            logger.warning(f"{symbol}: invalid qty/notional -> skip")
+            return
 
-    try:
-        rate_limited_request(
-            client.place_order,
-            category="linear",
+        side = "Buy" if decision == "LONG" else "Sell"
+        logger.info(
+            f"{symbol}: {decision} qty={qty} entry≈{mid_price:.4f} "
+            f"tp={tp_price:.4f} sl={sl_price:.4f} ({reason})"
+        )
+
+        # maker-first, then taker
+        try:
+            entry_order = self.exchange.place_limit_order(
+                symbol=symbol,
+                side=side,
+                price=mid_price,
+                qty=qty,
+                reduce_only=False,
+                post_only=True,
+            )
+            order_id = entry_order.get("id") or entry_order.get("order_id") if entry_order else None
+            start_t = now_ts()
+            filled = False
+            fill_price = mid_price
+
+            while now_ts() - start_t < POST_ONLY_TIMEOUT:
+                status = self.exchange.get_order_status(symbol, order_id)
+                st = status.get("status", "")
+                if st in ("closed", "filled"):
+                    filled = True
+                    fill_price = float(status.get("avg_price", mid_price))
+                    break
+                time.sleep(0.1)
+
+            if not filled:
+                if order_id:
+                    self.exchange.cancel_order(symbol, order_id)
+                mkt = self.exchange.place_market_order(
+                    symbol=symbol,
+                    side=side,
+                    qty=qty,
+                    reduce_only=False,
+                )
+                fill_price = float(mkt.get("average") or mkt.get("price") or mid_price) if mkt else mid_price
+
+        except Exception as e:
+            logger.exception(f"{symbol}: entry order failed: {e}")
+            return
+
+        # TP/SL placement (automatic, secure)
+        try:
+            reduce_side = "Sell" if side.lower() in ("buy", "long") else "Buy"
+            tp_order = self.exchange.place_limit_order(
+                symbol=symbol,
+                side=reduce_side,
+                price=tp_price,
+                qty=qty,
+                reduce_only=True,
+                post_only=False,
+            )
+            sl_order = self.exchange.place_stop_market_order(
+                symbol=symbol,
+                side=reduce_side,
+                qty=qty,
+                stop_price=sl_price,
+                reduce_only=True,
+            )
+            if not tp_order or not sl_order:
+                logger.error(f"{symbol}: TP or SL placement failed -> emergency close")
+                self.exchange.place_market_order(
+                    symbol=symbol,
+                    side=reduce_side,
+                    qty=qty,
+                    reduce_only=True,
+                )
+                return
+        except Exception as e:
+            logger.exception(f"{symbol}: TP/SL placement failed: {e}")
+            try:
+                reduce_side = "Sell" if side.lower() in ("buy", "long") else "Buy"
+                self.exchange.place_market_order(
+                    symbol=symbol,
+                    side=reduce_side,
+                    qty=qty,
+                    reduce_only=True,
+                )
+            except Exception as e2:
+                logger.exception(f"{symbol}: emergency close failed: {e2}")
+            return
+
+        pos = Position(
             symbol=symbol,
             side=side,
-            orderType="Market",
-            qty=str(qty),
-            timeInForce="GoodTillCancel",
-            reduceOnly=False,
-            closeOnTrigger=False,
-            takeProfit=str(tp_price),
-            stopLoss=str(sl_price),
-            tpTriggerBy="LastPrice",
-            slTriggerBy="LastPrice",
-            positionIdx=0
+            qty=qty,
+            entry_price=fill_price,
+            tp_price=tp_price,
+            sl_price=sl_price,
+            notional=notional,
         )
-        open_positions[symbol] = {"side": side, "size": qty, "entry": price}
-    except Exception as e:
-        print("[ERROR] place_order:", e)
+        self.open_positions[symbol] = pos
+        logger.info(f"{symbol}: position opened {pos}")
 
 
-# ============ MAIN LOOP ============
+# ===== MarketWorker with WebSocket (one per symbol) =====
 
-> Crypto:
-def main_loop():
-    print("=== ZUB BYBIT FUTURES SCALPER – MODE B (Aggressive + Safe) ===")
-    print("Symbols:", SYMBOLS)
-    print("Timeframe: 5m with 15m confirmation")
-    print("95% equity, 3x leverage, 1% TP, 0.5% SL")
-    while True:
-        reset_daily_if_needed()
-        update_daily_loss()
-        refresh_positions()
+class MarketWorker(threading.Thread):
+    def __init__(self, symbol: str, engine: DecisionEngine, exchange: ExchangeClient, testnet: bool):
+        super().__init__(daemon=True)
+        self.symbol = symbol
+        self.engine = engine
+        self.exchange = exchange
+        self.testnet = testnet
 
-        if trading_paused:
-            time.sleep(60)
-            continue
+        self.ws: Optional[websocket.WebSocketApp] = None
+        self.running = True
 
-        if not can_open_new_position():
-            time.sleep(10)
-            continue
+        self.orderbook: Dict[str, Dict[float, float]] = {"bids": {}, "asks": {}}
+        self.last_orderbook_ts: float = 0.0
 
-        for sym in SYMBOLS:
-            if sym in open_positions:
-                continue
+        self.trades: deque = deque(maxlen=500)
+        self.candles_1m: deque = deque(maxlen=500)
+        self.candles_5m: deque = deque(maxlen=500)
+        self.price_samples: deque = deque(maxlen=200)
 
-            direction = decide_direction(sym)
-            if direction is None:
-                continue
+        self.last_eval_ts: float = 0.0
 
-            df5 = fetch_klines(sym, TF_5M, limit=2)
-            if df5.empty:
-                continue
-            entry_price = df5["close"].iloc[-1]
+    def _ws_url(self) -> str:
+        return PUBLIC_WS_TESTNET if self.testnet else PUBLIC_WS_MAINNET
 
-            place_bracket_order(sym, direction, entry_price)
-            time.sleep(2)   # tiny delay after entry
-
-        time.sleep(SCAN_INTERVAL)
-
-
-# ============ WEBSOCKET HANDLER ============
-
-def ws_on_message(ws, message):
-    try:
-        data = json.loads(message)
-        topic = data.get("topic", "")
-        if not topic.startswith("orderbook.50."):
-            return
-        symbol = topic.split(".")[-1]
-        ob_list = data.get("data", [])
-        if not ob_list:
-            return
-        ob = ob_list[0]
-        bids = ob.get("b", [])
-        asks = ob.get("a", [])
-        orderbook_data[symbol] = {"bids": bids, "asks": asks}
-    except Exception as e:
-        print("[WS ERROR] on_message:", e)
-
-
-def ws_on_open(ws):
-    try:
-        args = [f"orderbook.50.{s}" for s in SYMBOLS]
-        sub = {"op": "subscribe", "args": args}
+    def _on_open(self, ws):
+        logger.info(f"{self.symbol}: WebSocket opened")
+        sub = {
+            "op": "subscribe",
+            "args": [
+                f"orderbook.50.{self.symbol}",
+                f"publicTrade.{self.symbol}",
+            ],
+        }
         ws.send(json.dumps(sub))
-        print("[WS] Subscribed to:", args)
-    except Exception as e:
-        print("[WS ERROR] on_open:", e)
 
-
-def ws_on_error(ws, error):
-    print("[WS ERROR]", error)
-
-
-def ws_on_close(ws, status, msg):
-    print("[WS] Closed:", status, msg)
-
-
-def ws_runner():
-    while True:
+    def _on_message(self, ws, message: str):
         try:
-            ws = websocket.WebSocketApp(
-                WS_URL,
-                on_open=ws_on_open,
-                on_message=ws_on_message,
-                on_error=ws_on_error,
-                on_close=ws_on_close
-            )
-            ws.run_forever(ping_interval=20, ping_timeout=10)
-        except Exception as e:
-            print("[WS] Runner exception:", e)
-        print("[WS] Reconnecting in 3s...")
-        time.sleep(3)
+            msg = json.loads(message)
+        except Exception:
+            return
+
+        topic = msg.get("topic", "")
+        if not topic:
+            return
+
+        if topic.startswith("orderbook.50."):
+            self._handle_orderbook(msg)
+        elif topic.startswith("publicTrade."):
+            self._handle_trades(msg)
+
+        # run decision engine every SCAN_INTERVAL
+        now = now_ts()
+        if now - self.last_eval_ts >= SCAN_INTERVAL:
+            self.last_eval_ts = now
+            self._maybe_evaluate()
+
+    def _handle_orderbook(self, msg: Dict[str, Any]) -> None:
+        data_list = msg.get("data") or []
+        if not data_list:
+            return
+        payload = data_list[0]
+        typ = msg.get("type", "snapshot")
+        bids = self.orderbook["bids"]
+        asks = self.orderbook["asks"]
+
+        ts = now_ts()
+
+        if typ == "snapshot":
+            bids.clear()
+            asks.clear()
+            for p, s in payload.get("b", []):
+                price = float(p)
+                size = float(s)
+                if size > 0:
+                    bids[price] = size
+            for p, s in payload.get("a", []):
+                price = float(p)
+                size = float(s)
+                if size > 0:
+                    asks[price] = size
+        else:  # delta
+            for p, s in payload.get("b", []):
+                price = float(p)
+                size = float(s)
+                old_size = bids.get(price, 0.0)
+                if size == 0:
+                    if old_size > 0:
+                        # cancellation event
+                        self.engine.spoof.on_order_event("bid", price, "cancel", ts)
+                        self.engine.whale[self.symbol].on_order_event(price, old_size, "cancel", ts)
+                        bids.pop(price, None)
+                else:
+                    if size > old_size:
+                        # new/add
+                        self.engine.spoof.on_order_event("bid", price, "new", ts)
+                        self.engine.whale[self.symbol].on_order_event(price, size, "new", ts)
+                    bids[price] = size
+            for p, s in payload.get("a", []):
+                price = float(p)
+                size = float(s)
+                old_size = asks.get(price, 0.0)
+                if size == 0:
+                    if old_size > 0:
+                        self.engine.spoof.on_order_event("ask", price, "cancel", ts)
+                        self.engine.whale[self.symbol].on_order_event(price, old_size, "cancel", ts)
+                        asks.pop(price, None)
+                else:
+                    if size > old_size:
+                        self.engine.spoof.on_order_event("ask", price, "new", ts)
+                        self.engine.whale[self.symbol].on_order_event(price, size, "new", ts)
+                    asks[price] = size
+
+        self.last_orderbook_ts = ts
+
+    def _handle_trades(self, msg: Dict[str, Any]) -> None:
+        data_list = msg.get("data") or []
+        ts_now = now_ts()
+        for t in data_list:
+            price = float(t.get("p") or 0.0)
+            size = float(t.get("v") or 0.0)
+            side = str(t.get("S") or "").lower()  # Buy/Sell
+            ts = float(t.get("T") or ts_now * 1000.0) / 1000.0
+            self.trades.append({"price": price, "size": size, "side": side, "ts": ts})
+            self.price_samples.append((ts, price))
+        self._update_candles()
+
+    def _update_candles(self) -> None:
+        if not self.trades:
+            return
+        # build 1m candle from recent trades
+        last_trade = self.trades[-1]
+        price = float(last_trade["price"])
+        ts = float(last_trade["ts"])
+        minute_bucket = int(ts // 60)
+        size_sum = sum(float(t["size"]) for t in list(self.trades)[-50:])  # approximate
+
+        if self.candles_1m and int(self.candles_1m[-1].get("bucket", 0)) == minute_bucket:
+            c = self.candles_1m[-1]
+            c["close"] = price
+            c["high"] = max(c["high"], price)
+            c["low"] = min(c["low"], price)
+            c["volume"] += size_sum
+        else:
+            self.candles_1m.append({
+                "bucket": minute_bucket,
+                "open": price,
+                "close": price,
+                "high": price,
+                "low": price,
+                "volume": size_sum,
+            })
+
+        # 5m aggregation
+        while len(self.candles_1m) >= 5 and (not self.candles_5m or len(self.candles_5m) < len(self.candles_1m) // 5):
+            chunk = list(self.candles_1m)[-5:]
+            o = chunk[0]["open"]
+            h = max(c["high"] for c in chunk)
+            l = min(c["low"] for c in chunk)
+            cl = chunk[-1]["close"]
+            vol = sum(c["volume"] for c in chunk)
+            self.candles_5m.append({
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": cl,
+                "volume": vol,
+            })
+
+    def _maybe_evaluate(self) -> None:
+        if not self.orderbook["bids"] or not self.orderbook["asks"]:
+            return
+        trades_list = list(self.trades)
+        candles_1m = list(self.candles_1m)
+        candles_5m = list(self.candles_5m)
+        recent_prices = list(self.price_samples)
+        if len(trades_list) < 10 or len(candles_1m) < 5 or len(candles_5m) < 1:
+            return
+        self.engine.evaluate_symbol(
+            symbol=self.symbol,
+            book=self.orderbook,
+            trades=trades_list,
+            candles_5m=candles_5m,
+            candles_1m=candles_1m,
+            recent_prices=recent_prices,
+        )
+
+    def _on_error(self, ws, error):
+        logger.error(f"{self.symbol}: WebSocket error: {error}")
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        logger.warning(f"{self.symbol}: WebSocket closed: {close_status_code} {close_msg}")
+        # loop in run() will reconnect
+
+    def run(self) -> None:
+        url = self._ws_url()
+        while self.running:
+            try:
+                self.ws = websocket.WebSocketApp(
+                    url,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                logger.info(f"{self.symbol}: connecting WebSocket {url}")
+                self.ws.run_forever(ping_interval=15, ping_timeout=10)
+            except Exception as e:
+                logger.exception(f"{self.symbol}: WebSocket run_forever error: {e}")
+            if self.running:
+                logger.info(f"{self.symbol}: reconnecting WebSocket in 3s")
+                time.sleep(3.0)
+
+    def stop(self) -> None:
+        self.running = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
 
 
-# ============ ENTRYPOINT ============
+# ===== Main =====
 
-if name == "main":
-    if not API_KEY or not API_SECRET:
-        print("Missing BYBIT_API_KEY or BYBIT_API_SECRET in environment.")
-        raise SystemExit
+def main():
+    logger.info("Starting multi-symbol WebSocket scalper bot...")
+    exchange = ExchangeClient(API_KEY, API_SECRET, testnet=TESTNET)
 
-    t = threading.Thread(target=ws_runner, daemon=True)
-    t.start()
+    # set leverage for each symbol
+    for s in SYMBOLS:
+        exchange.set_leverage(s, LEVERAGE)
 
-    time.sleep(3)  # small warm-up for WS
+    engine = DecisionEngine(exchange, SYMBOLS)
+    workers: List[MarketWorker] = []
 
+    for s in SYMBOLS:
+        w = MarketWorker(symbol=s, engine=engine, exchange=exchange, testnet=TESTNET)
+        w.start()
+        workers.append(w)
+
+    logger.info("Workers started. Press Ctrl+C to stop.")
     try:
-        main_loop()
+        while True:
+            time.sleep(1.0)
     except KeyboardInterrupt:
-        print("Bot stopped by user.")
+        logger.info("Stopping workers...")
+        for w in workers:
+            w.stop()
+        time.sleep(2.0)
+        logger.info("Exited.")
+
+
+if __name__ == "__main__":
+    main()
