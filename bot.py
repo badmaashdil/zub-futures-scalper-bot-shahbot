@@ -985,6 +985,7 @@ class DecisionEngine:
             f"TP: {tp_price}\nSL: {sl_price}\nReason: {reason}"
         )
         logger.info(f"{symbol}: position opened {pos}")
+
 # ===== MarketWorker (WebSocket per symbol) =====
 
 class MarketWorker(threading.Thread):
@@ -1013,37 +1014,52 @@ class MarketWorker(threading.Thread):
 
     def _on_open(self, ws):
         logger.info(f"{self.symbol}: WebSocket opened")
+        # one-time info, fine to send
         tg(f"🔌 WebSocket opened for {self.symbol}")
-        sub = {
-            "op": "subscribe",
-            "args": [
-                f"orderbook.50.{self.symbol}",
-                f"publicTrade.{self.symbol}",
-            ],
-        }
-        ws.send(json.dumps(sub))
+        try:
+            sub = {
+                "op": "subscribe",
+                "args": [
+                    f"orderbook.50.{self.symbol}",
+                    f"publicTrade.{self.symbol}",
+                ],
+            }
+            ws.send(json.dumps(sub))
+        except Exception as e:
+            logger.exception(f"{self.symbol}: error sending WS subscribe: {e}")
 
     def _on_message(self, ws, message: str):
+        """
+        MAIN FIX:
+        - Wrap everything in try/except
+        - If strategy code throws, we just log, we DON'T kill the websocket.
+        """
         try:
             msg = json.loads(message)
-        except Exception:
-            return
-        topic = msg.get("topic", "")
-        if not topic:
-            return
-        if topic.startswith("orderbook.50."):
-            self._handle_orderbook(msg)
-        elif topic.startswith("publicTrade."):
-            self._handle_trades(msg)
-        now = now_ts()
-        if now - self.last_eval_ts >= SCAN_INTERVAL:
-            self.last_eval_ts = now
-            self._maybe_evaluate()
+            topic = msg.get("topic", "")
+            if not topic:
+                return
+
+            if topic.startswith("orderbook.50."):
+                self._handle_orderbook(msg)
+            elif topic.startswith("publicTrade."):
+                self._handle_trades(msg)
+
+            now = now_ts()
+            if now - self.last_eval_ts >= SCAN_INTERVAL:
+                self.last_eval_ts = now
+                self._maybe_evaluate()
+
+        except Exception as e:
+            # This is what was killing your WS before.
+            logger.exception(f"{self.symbol}: exception in _on_message: {e}")
+            # DO NOT raise / DO NOT call ws.close() here → keep stream alive.
 
     def _handle_orderbook(self, msg: Dict[str, Any]) -> None:
         data_list = msg.get("data") or []
         if not data_list:
             return
+
         payload = data_list[0]
         typ = msg.get("type", "snapshot")
         bids = self.orderbook["bids"]
@@ -1078,6 +1094,7 @@ class MarketWorker(threading.Thread):
                         self.engine.spoof.on_order_event("bid", price, "new", ts)
                         self.engine.whale[self.symbol].on_order_event(price, size, "new", ts)
                     bids[price] = size
+
             for p, s in payload.get("a", []):
                 price = float(p)
                 size = float(s)
@@ -1093,6 +1110,7 @@ class MarketWorker(threading.Thread):
                         self.engine.whale[self.symbol].on_order_event(price, size, "new", ts)
                     asks[price] = size
 
+        # clean zero sizes
         self.orderbook["bids"] = {p: s for p, s in bids.items() if s > 0}
         self.orderbook["asks"] = {p: s for p, s in asks.items() if s > 0}
         self.last_orderbook_ts = ts
@@ -1164,6 +1182,7 @@ class MarketWorker(threading.Thread):
             size = float(ex_pos.get("contracts") or ex_pos.get("size") or 0.0)
         if size != 0:
             return
+
         bids = self.orderbook.get("bids", {})
         asks = self.orderbook.get("asks", {})
         if bids and asks:
@@ -1172,6 +1191,7 @@ class MarketWorker(threading.Thread):
             mid = (best_bid + best_ask) / 2.0
         else:
             mid = pos.tp_price
+
         self.engine.on_position_closed(self.symbol, mid)
 
     def _maybe_evaluate(self) -> None:
@@ -1195,12 +1215,12 @@ class MarketWorker(threading.Thread):
         )
 
     def _on_error(self, ws, error):
+        # IMPORTANT: log only, no Telegram (avoids spam + recursion)
         logger.error(f"{self.symbol}: WebSocket error: {error}")
-        tg(f"⚠️ WebSocket error for {self.symbol}: {error}")
 
     def _on_close(self, ws, close_status_code, close_msg):
+        # Also only log here, no Telegram spam
         logger.warning(f"{self.symbol}: WebSocket closed: {close_status_code} {close_msg}")
-        tg(f"⚠️ WebSocket closed for {self.symbol}: {close_status_code} {close_msg}")
 
     def run(self) -> None:
         url = self._ws_url()
@@ -1229,7 +1249,7 @@ class MarketWorker(threading.Thread):
                 self.ws.close()
             except Exception:
                 pass
-
+                
 # ===== Main =====
 
 def main():
