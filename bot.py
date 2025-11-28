@@ -69,20 +69,55 @@ logger = logging.getLogger("ws_scalper_secure")
 def now_ts() -> float:
     return time.time()
 
-# ===== TELEGRAM =====
+# ===== TELEGRAM (rate-limited, important alerts only) =====
 
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
 
+# send at most 1 message every X seconds
+TELEGRAM_MIN_INTERVAL_SEC = 10.0
+# if same text repeats within this window, skip it
+TELEGRAM_DUP_SUPPRESS_SEC = 30.0
+# HTTP timeout for Telegram
+TELEGRAM_HTTP_TIMEOUT = 3.0
+
+_last_tg_time: float = 0.0
+_last_tg_text: str = ""
+_last_tg_text_time: float = 0.0
+
 def tg(message: str):
+    """
+    Telegram helper with:
+    - global enable/disable based on env vars
+    - rate limiting (avoid spamming)
+    - duplicate suppression (skip same msg spam)
+    """
+    global _last_tg_time, _last_tg_text, _last_tg_text_time
+
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        # Telegram not configured => silently ignore
         return
+
+    now = now_ts()
+
+    # 1) Global rate limit: at most 1 msg every TELEGRAM_MIN_INTERVAL_SEC
+    if now - _last_tg_time < TELEGRAM_MIN_INTERVAL_SEC:
+        return
+
+    # 2) Duplicate suppression: if same text within DUP window, skip
+    if message == _last_tg_text and (now - _last_tg_text_time) < TELEGRAM_DUP_SUPPRESS_SEC:
+        return
+
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-        requests.post(url, data=payload, timeout=1)
+        requests.post(url, data=payload, timeout=TELEGRAM_HTTP_TIMEOUT)
+        _last_tg_time = now
+        _last_tg_text = message
+        _last_tg_text_time = now
     except Exception as e:
-        print("Telegram alert failed:", e)
+        # just log once, don't crash or spam
+        logger.warning(f"Telegram alert failed: {e}")
 
 # ===== PnL & Position sizing =====
 
@@ -123,6 +158,7 @@ class Position:
     sl_price: float
     notional: float
     ts_open: float = field(default_factory=now_ts)
+
 # ===== ExchangeClient (ccxt) =====
 
 class ExchangeClient:
