@@ -1258,6 +1258,19 @@ def main():
     logger.info("Starting multi-symbol WS scalper bot (5% kill + micro filters + TG)...")
     tg("🟢 Bot restarted and running.")
 
+    HEARTBEAT_INTERVAL_SEC = 600  # 10 minutes
+
+    start_heartbeat()  # <---- YOU MUST ADD THIS LINE HERE
+
+    exchange = ExchangeClient(API_KEY, API_SECRET, testnet=TESTNET)
+    emergency_close_all_positions(exchange, SYMBOLS)
+
+    STARTING_EQUITY = exchange.get_balance()
+    bot_killed = False
+    logger.info(f"Kill-switch starting equity: {STARTING_EQUITY:.4f}, trigger={(GLOBAL_KILL_TRIGGER*100):.1f}%")
+    tg(f"📊 Starting equity: {STARTING_EQUITY:.4f} USDT. Kill at {(GLOBAL_KILL_TRIGGER*100):.1f}% loss.")
+
+
     exchange = ExchangeClient(API_KEY, API_SECRET, testnet=TESTNET)
 
     emergency_close_all_positions(exchange, SYMBOLS)
