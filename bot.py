@@ -288,7 +288,7 @@ class ExchangeClient:
                 params,
             )
 
-    def place_stop_market(
+def place_stop_market(
         self,
         symbol: str,
         side: str,
@@ -310,7 +310,7 @@ class ExchangeClient:
                 params,
             )
 
-    def order_status(self, symbol: str, oid: Optional[str]) -> Dict[str, Any]:
+def order_status(self, symbol: str, oid: Optional[str]) -> Dict[str, Any]:
         if not oid:
             return {}
         try:
@@ -325,7 +325,7 @@ class ExchangeClient:
             logger.warning(f"{symbol}: fetch_order error: {e}")
             return {}
 
-    def cancel(self, symbol: str, oid: str) -> bool:
+def cancel(self, symbol: str, oid: str) -> bool:
         try:
             with self.lock:
                 self.client.cancel_order(oid, self._sym(symbol))
@@ -334,7 +334,7 @@ class ExchangeClient:
             logger.warning(f"{symbol}: cancel_order error: {e}")
             return False
 
-    def close_market(self, symbol: str) -> None:
+def close_market(self, symbol: str) -> None:
         p = self.get_position(symbol)
         if not p:
             return
@@ -375,12 +375,12 @@ def emergency_close_all(exchange: ExchangeClient, symbols: List[str]) -> None:
 # ================================================================
 
 class SpoofDetector:
-    def __init__(self, window: float = 1.0, repeat: int = 3):
+def __init__(self, window: float = 1.0, repeat: int = 3):
         self.window = window
         self.repeat = repeat
         self.data: Dict[Tuple[str, float], deque] = defaultdict(deque)
 
-    def on_event(self, side: str, price: float, etype: str, ts: float) -> None:
+def on_event(self, side: str, price: float, etype: str, ts: float) -> None:
         k = (side, float(price))
         dq = self.data[k]
         dq.append((etype, ts))
@@ -394,12 +394,12 @@ class SpoofDetector:
 
 
 class WhaleCancelDetector:
-    def __init__(self, th: float, window: float = 5.0):
+def __init__(self, th: float, window: float = 5.0):
         self.th = th
         self.window = window
         self.data: Dict[float, deque] = defaultdict(deque)
 
-    def on_event(self, price: float, size: float, etype: str, ts: float) -> None:
+def on_event(self, price: float, size: float, etype: str, ts: float) -> None:
         if size < self.th:
             return
         dq = self.data[float(price)]
@@ -407,7 +407,7 @@ class WhaleCancelDetector:
         while dq and ts - dq[0][1] > self.window:
             dq.popleft()
 
-    def check(self, price: float) -> bool:
+def check(self, price: float) -> bool:
         dq = self.data.get(float(price), deque())
         if not dq:
             return False
@@ -502,14 +502,14 @@ class DecisionEngine:
         self.last_trade_ts = 0.0
         self.lock = threading.Lock()
 
-    def pause(self, sec: float) -> None:
+def pause(self, sec: float) -> None:
         self.pause_until = max(self.pause_until, now_ts() + sec)
         logger.warning(f"Engine paused for {sec:.1f}s")
 
-    def is_paused(self) -> bool:
+def is_paused(self) -> bool:
         return now_ts() < self.pause_until
 
-    def check_kill(self, equity: float) -> bool:
+def check_kill(self, equity: float) -> bool:
         global STARTING_EQUITY, bot_killed, kill_alert_sent
 
         if bot_killed:
@@ -533,7 +533,7 @@ class DecisionEngine:
 
         return False
 
-    def on_close(self, symbol: str, exit_price: float) -> None:
+def on_close(self, symbol: str, exit_price: float) -> None:
         pos = self.open_positions.get(symbol)
         if not pos:
             return
@@ -546,7 +546,7 @@ class DecisionEngine:
         pnl = calc_pnl(pos.side, pos.entry_price, exit_price, pos.qty)
         tg(f"📤 EXIT | {symbol}\nReason: {hit}\nPnL: {pnl} USDT")
 
-    def evaluate(
+def evaluate(
         self,
         symbol: str,
         book: Dict[str, Dict[float, float]],
@@ -559,7 +559,7 @@ class DecisionEngine:
         with self.lock:
             self._evaluate_locked(symbol, book, trades, c5, c1, prices, last_ob_ts)
 
-    def _evaluate_locked(
+def _evaluate_locked(
         self,
         symbol: str,
         book: Dict[str, Dict[float, float]],
@@ -695,7 +695,7 @@ class DecisionEngine:
 # ================================================================
 
 class MarketWorker(threading.Thread):
-    def __init__(self, symbol: str, engine: DecisionEngine, exchange: ExchangeClient, testnet: bool):
+def __init__(self, symbol: str, engine: DecisionEngine, exchange: ExchangeClient, testnet: bool):
         super().__init__(daemon=True)
         self.symbol = symbol
         self.engine = engine
@@ -717,10 +717,10 @@ class MarketWorker(threading.Thread):
         self.last_ws_msg_ts: float = now_ts()
         self.ws_alive: bool = True   # For transition detection (dead -> alive)
 
-    def url(self) -> str:
+def url(self) -> str:
         return PUBLIC_WS_TESTNET if self.testnet else PUBLIC_WS_MAINNET
 
-    def run(self) -> None:
+def run(self) -> None:
         while self.running:
             try:
                 self.ws = websocket.WebSocketApp(
@@ -739,7 +739,7 @@ class MarketWorker(threading.Thread):
                 logger.info(f"{self.symbol}: reconnecting WebSocket in 3s...")
                 time.sleep(3.0)
 
-    def on_open(self, ws):
+def on_open(self, ws):
         logger.info(f"{self.symbol}: WebSocket opened")
         self.last_ws_msg_ts = now_ts()
         self.ws_alive = True
@@ -755,13 +755,13 @@ class MarketWorker(threading.Thread):
         except Exception as e:
             logger.exception(f"{self.symbol}: error sending subscribe: {e}")
 
-    def on_close(self, ws, code, msg):
+def on_close(self, ws, code, msg):
         logger.warning(f"{self.symbol}: WebSocket closed: {code} {msg}")
 
-    def on_error(self, ws, err):
+def on_error(self, ws, err):
         logger.error(f"{self.symbol}: WebSocket error: {err}")
 
-    def on_message(self, ws, message: str):
+def on_message(self, ws, message: str):
         try:
             # Mark websocket as alive on every message
             self.last_ws_msg_ts = now_ts()
@@ -851,7 +851,7 @@ def handle_ob(self, j: Dict[str, Any]) -> None:
         self.book["asks"] = {p: s for p, s in asks.items() if s > 0}
         self.last_ob_ts = ts
         
-    def handle_trades(self, j: Dict[str, Any]) -> None:
+def handle_trades(self, j: Dict[str, Any]) -> None:
         data = j.get("data", [])
         for t in data:
             price = float(t.get("p") or 0.0)
@@ -862,7 +862,7 @@ def handle_ob(self, j: Dict[str, Any]) -> None:
             self.price_samples.append((ts, price))
         self.update_candles()
 
-    def update_candles(self) -> None:
+def update_candles(self) -> None:
         if not self.trades:
             return
         last_trade = self.trades[-1]
@@ -896,7 +896,7 @@ def handle_ob(self, j: Dict[str, Any]) -> None:
                 "volume": sum(c["volume"] for c in chunk),
             })
 
-    def maybe_eval(self) -> None:
+def maybe_eval(self) -> None:
         # 1) First, check if previously open position is now closed on exchange (normal TP/SL)
         pos = self.engine.open_positions.get(self.symbol)
         if pos:
