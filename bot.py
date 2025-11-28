@@ -851,7 +851,7 @@ def handle_ob(self, j: Dict[str, Any]) -> None:
         self.book["asks"] = {p: s for p, s in asks.items() if s > 0}
         self.last_ob_ts = ts
         
-        def handle_trades(self, j: Dict[str, Any]) -> None:
+    def handle_trades(self, j: Dict[str, Any]) -> None:
         data = j.get("data", [])
         for t in data:
             price = float(t.get("p") or 0.0)
