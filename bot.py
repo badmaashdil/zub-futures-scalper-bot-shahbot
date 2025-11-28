@@ -11,6 +11,7 @@ import ccxt              # pip install ccxt
 import websocket         # pip install websocket-client
 import requests          # pip install requests
 
+
 # ===== CONFIG =====
 
 API_KEY = os.getenv("BYBIT_API_KEY")
@@ -19,7 +20,8 @@ API_SECRET = os.getenv("BYBIT_API_SECRET")
 if not API_KEY or not API_SECRET:
     raise Exception("API keys missing. Set BYBIT_API_KEY and BYBIT_API_SECRET env vars.")
 
-TESTNET = False   # True for testnet, False for live
+# True = Bybit testnet, False = live
+TESTNET = False
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "DOGEUSDT"]
 CCXT_SYMBOL_MAP = {
@@ -66,8 +68,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ws_scalper_secure")
 
+
 def now_ts() -> float:
     return time.time()
+
 
 # ===== TELEGRAM (rate-limited, important alerts only) =====
 
@@ -85,12 +89,14 @@ _last_tg_time: float = 0.0
 _last_tg_text: str = ""
 _last_tg_text_time: float = 0.0
 
+
 def tg(message: str):
     """
-    Telegram helper with:
-    - global enable/disable based on env vars
-    - rate limiting (avoid spamming)
-    - duplicate suppression (skip same msg spam)
+    Safe Telegram helper:
+    - no message if TG env vars are not set
+    - rate limiting (avoid spamming / hitting Telegram limits)
+    - duplicate suppression (skip same text if sent recently)
+    - never raises exceptions, only logs a single warning
     """
     global _last_tg_time, _last_tg_text, _last_tg_text_time
 
@@ -104,7 +110,7 @@ def tg(message: str):
     if now - _last_tg_time < TELEGRAM_MIN_INTERVAL_SEC:
         return
 
-    # 2) Duplicate suppression: if same text within DUP window, skip
+    # 2) Duplicate suppression
     if message == _last_tg_text and (now - _last_tg_text_time) < TELEGRAM_DUP_SUPPRESS_SEC:
         return
 
@@ -119,34 +125,51 @@ def tg(message: str):
         # just log once, don't crash or spam
         logger.warning(f"Telegram alert failed: {e}")
 
+
 # ===== PnL & Position sizing =====
 
 def calc_pnl(side: str, entry: float, exit: float, qty: float) -> float:
+    """
+    Simple PnL in quote currency (USDT).
+    """
     if side.lower() == "buy":
         pnl = (exit - entry) * qty
     else:
         pnl = (entry - exit) * qty
     return round(pnl, 4)
 
+
 def compute_position_and_prices(
     equity_usd: float,
     entry_price: float,
     side: str,
 ) -> Tuple[float, float, float, float]:
+    """
+    Given current equity and entry price, compute:
+    - qty
+    - notional
+    - tp_price
+    - sl_price
+    """
     if equity_usd <= 0 or entry_price <= 0:
         return 0.0, 0.0, 0.0, 0.0
+
     position_notional = equity_usd * MARGIN_FRACTION * LEVERAGE
     qty = position_notional / entry_price
     qty = float(f"{qty:.6f}")
+
     tp_frac = TP_PCT_ON_POSITION
     sl_frac = SL_PCT_ON_POSITION
+
     if side.lower() in ("buy", "long"):
         tp_price = entry_price * (1.0 + tp_frac)
         sl_price = entry_price * (1.0 - sl_frac)
     else:
         tp_price = entry_price * (1.0 - tp_frac)
         sl_price = entry_price * (1.0 + sl_frac)
+
     return qty, position_notional, tp_price, sl_price
+
 
 @dataclass
 class Position:
@@ -158,6 +181,7 @@ class Position:
     sl_price: float
     notional: float
     ts_open: float = field(default_factory=now_ts)
+
 
 # ===== ExchangeClient (ccxt) =====
 
@@ -207,6 +231,7 @@ class ExchangeClient:
             except Exception as e:
                 logger.warning(f"{symbol}: fetch_positions error: {e}")
                 return None
+
         for p in positions:
             size = float(p.get("contracts") or p.get("size") or 0.0)
             if size != 0:
@@ -228,6 +253,7 @@ class ExchangeClient:
             params["reduce_only"] = True
         if post_only:
             params["timeInForce"] = "PostOnly"
+
         with self.lock:
             order = self.client.create_order(
                 symbol=ccxt_symbol,
@@ -250,6 +276,7 @@ class ExchangeClient:
         params: Dict[str, Any] = {}
         if reduce_only:
             params["reduce_only"] = True
+
         with self.lock:
             order = self.client.create_order(
                 symbol=ccxt_symbol,
@@ -273,6 +300,7 @@ class ExchangeClient:
             "stopLossPrice": stop_price,
             "reduce_only": reduce_only,
         }
+
         with self.lock:
             order = self.client.create_order(
                 symbol=ccxt_symbol,
@@ -292,7 +320,7 @@ class ExchangeClient:
             except Exception as e:
                 logger.warning(f"{symbol}: cancel_order error: {e}")
                 return False
-
+                
     def get_order_status(self, symbol: str, order_id: Optional[str]) -> Dict[str, Any]:
         if not order_id:
             return {}
