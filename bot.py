@@ -158,6 +158,7 @@ class Position:
     notional: float
     ts_open: float = field(default_factory=now_ts)
 
+
 # ================================================================
 # PnL & POSITION SIZING
 # ================================================================
@@ -196,7 +197,7 @@ def compute_position_and_prices(
 # ================================================================
 
 class ExchangeClient:
-    def init(self, key: str, secret: str, testnet: bool = True):
+    def __init__(self, key: str, secret: str, testnet: bool = True):
         cfg: Dict[str, Any] = {
             "apiKey": key,
             "secret": secret,
@@ -277,28 +278,35 @@ class ExchangeClient:
         if reduce:
             params["reduce_only"] = True
         with self.lock:
+            # price must be None for market orders in ccxt
             return self.client.create_order(
                 self._sym(symbol),
                 "market",
                 side.lower(),
                 qty,
+                None,
                 params,
             )
 
     def place_stop_market(
         self,
         symbol: str,
-side: str,
+        side: str,
         qty: float,
         stop_price: float,
     ) -> Dict[str, Any]:
-        params = {"stopLossPrice": stop_price, "reduce_only": True}
+        # Bybit stop-loss via ccxt: market with stopLossPrice param
+        params: Dict[str, Any] = {
+            "stopLossPrice": stop_price,
+            "reduce_only": True,
+        }
         with self.lock:
             return self.client.create_order(
                 self._sym(symbol),
                 "market",
                 side.lower(),
                 qty,
+                None,
                 params,
             )
 
@@ -342,6 +350,7 @@ side: str,
                     "market",
                     close_side,
                     abs(size),
+                    None,
                     {"reduce_only": True},
                 )
                 logger.warning(f"{symbol}: emergency market close size={size}")
@@ -366,7 +375,7 @@ def emergency_close_all(exchange: ExchangeClient, symbols: List[str]) -> None:
 # ================================================================
 
 class SpoofDetector:
-    def init(self, window: float = 1.0, repeat: int = 3):
+    def __init__(self, window: float = 1.0, repeat: int = 3):
         self.window = window
         self.repeat = repeat
         self.data: Dict[Tuple[str, float], deque] = defaultdict(deque)
@@ -385,7 +394,7 @@ class SpoofDetector:
 
 
 class WhaleCancelDetector:
-    def init(self, th: float, window: float = 5.0):
+    def __init__(self, th: float, window: float = 5.0):
         self.th = th
         self.window = window
         self.data: Dict[float, deque] = defaultdict(deque)
@@ -407,6 +416,8 @@ class WhaleCancelDetector:
         if adds + cancels == 0:
             return False
         return (cancels / (adds + cancels)) > 0.3
+
+
 # ================================================================
 # MICRO FILTER HELPERS
 # ================================================================
@@ -481,7 +492,7 @@ def unpredictable(prices: List[Tuple[float, float]]) -> bool:
 # ================================================================
 
 class DecisionEngine:
-    def init(self, exchange: ExchangeClient, symbols: List[str]):
+    def __init__(self, exchange: ExchangeClient, symbols: List[str]):
         self.exchange = exchange
         self.symbols = symbols
         self.open_positions: Dict[str, Position] = {}
@@ -526,7 +537,6 @@ class DecisionEngine:
         pos = self.open_positions.get(symbol)
         if not pos:
             return
-
         del self.open_positions[symbol]
 
         dist_tp = abs(exit_price - pos.tp_price)
@@ -661,7 +671,8 @@ class DecisionEngine:
             tg(f"❌ Entry failed {symbol}: {e}")
             self.pause(ERROR_PAUSE_SEC)
             return
-# TP & SL
+
+        # TP & SL
         try:
             reduce_side = "Sell" if side == "Buy" else "Buy"
             self.exchange.place_limit(symbol, reduce_side, tp, qty, reduce=True, post=False)
@@ -684,8 +695,8 @@ class DecisionEngine:
 # ================================================================
 
 class MarketWorker(threading.Thread):
-    def init(self, symbol: str, engine: DecisionEngine, exchange: ExchangeClient, testnet: bool):
-        super().init(daemon=True)
+    def __init__(self, symbol: str, engine: DecisionEngine, exchange: ExchangeClient, testnet: bool):
+        super().__init__(daemon=True)
         self.symbol = symbol
         self.engine = engine
         self.exchange = exchange
@@ -868,7 +879,8 @@ class MarketWorker(threading.Thread):
                 "low": price,
                 "volume": last_trade["size"],
             })
-if len(self.c1) >= 5 and (not self.c5 or len(self.c5) < len(self.c1) // 5):
+
+        if len(self.c1) >= 5 and (not self.c5 or len(self.c5) < len(self.c1) // 5):
             chunk = list(self.c1)[-5:]
             self.c5.append({
                 "open": chunk[0]["open"],
@@ -971,7 +983,8 @@ def main():
         w = MarketWorker(s, engine, exchange, TESTNET)
         w.start()
         workers.append(w)
-logger.info("Workers started. Press Ctrl+C to stop.")
+
+    logger.info("Workers started. Press Ctrl+C to stop.")
     try:
         while True:
             time.sleep(1.0)
@@ -981,5 +994,5 @@ logger.info("Workers started. Press Ctrl+C to stop.")
         # Threads will naturally stop when process exits
 
 
-if name == "main":
+if __name__ == "__main__":
     main()
