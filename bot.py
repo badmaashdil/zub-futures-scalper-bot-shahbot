@@ -786,17 +786,17 @@ class MarketWorker(threading.Thread):
             logger.exception(f"{self.symbol}: exception in on_message: {e}")
             # Do NOT close WS here – let reconnect loop handle it.
         
-        def handle_ob(self, j: Dict[str, Any]) -> None:
-        data = j.get("data", [])
-        if not data:
-            return  # ignore empty messages safely
+def handle_ob(self, j: Dict[str, Any]) -> None:
+    data = j.get("data", [])
+    if not data:
+        return  # ignore empty messages safely
 
-        payload = data[0]
-        typ = j.get("type", "snapshot")
-        ts = now_ts()
+    payload = data[0]
+    typ = j.get("type", "snapshot")
+    ts = now_ts()
 
-        bids = self.book["bids"]
-        asks = self.book["asks"]
+    bids = self.book["bids"]
+    asks = self.book["asks"]
 
         if typ == "snapshot":
             bids.clear()
