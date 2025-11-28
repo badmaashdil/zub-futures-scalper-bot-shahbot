@@ -789,7 +789,8 @@ class MarketWorker(threading.Thread):
     def handle_ob(self, j: Dict[str, Any]) -> None:
         data = j.get("data", [])
         if not data:
-            return
+            return  # FIXED → safely skip empty messages
+
         payload = data[0]
         typ = j.get("type", "snapshot")
         ts = now_ts()
