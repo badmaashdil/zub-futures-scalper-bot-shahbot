@@ -755,101 +755,76 @@ class MarketWorker(threading.Thread):
         except Exception as e:
             logger.exception(f"{self.symbol}: error sending subscribe: {e}")
 
-    def on_close(self, ws, code, msg) -> None:
-        logger.warning(f"{self.symbol}: WebSocket closed: {code} {msg}")
-
-    def on_error(self, ws, err) -> None:
-        logger.error(f"{self.symbol}: WebSocket error: {err}")
-
-    def on_message(self, ws, message: str) -> None:
-        try:
-            # Mark websocket as alive on every message
-            self.last_ws_msg_ts = now_ts()
-
-            msg = json.loads(message)
-            topic = msg.get("topic", "")
-
-            if not topic:
-                return
-
-            if topic.startswith("orderbook.50."):
-                self.handle_ob(msg)
-            elif topic.startswith("publicTrade."):
-                self.handle_trades(msg)
-
-            now = now_ts()
-            if now - self.last_eval >= SCAN_INTERVAL:
-                self.last_eval = now
-                self.maybe_eval()
-
-        except Exception as e:
-            logger.exception(f"{self.symbol}: exception in on_message: {e}")
-            # Do NOT close WS here – let reconnect loop handle it.
-
     def handle_ob(self, j: Dict[str, Any]) -> None:
-        data = j.get("data", [])
-        if not data:
-            return  # ignore empty messages safely
+    data = j.get("data", [])
 
-        payload = data[0]
-        typ = j.get("type", "snapshot")
-        ts = now_ts()
+    # ---- FIX: ignore empty or invalid orderbook messages ----
+    if not isinstance(data, list) or len(data) == 0:
+        return
 
-        bids = self.book["bids"]
-        asks = self.book["asks"]
+    payload = data[0]
+    if not isinstance(payload, dict):
+        return
 
-        if typ == "snapshot":
-            bids.clear()
-            asks.clear()
+    typ = j.get("type", "snapshot")
+    ts = now_ts()
 
-            for p, s in payload.get("b", []):
-                price = float(p)
-                size = float(s)
-                if size > 0:
-                    bids[price] = size
+    bids = self.book["bids"]
+    asks = self.book["asks"]
 
-            for p, s in payload.get("a", []):
-                price = float(p)
-                size = float(s)
-                if size > 0:
-                    asks[price] = size
+    if typ == "snapshot":
+        bids.clear()
+        asks.clear()
 
-        else:
-            for p, s in payload.get("b", []):
-                price = float(p)
-                size = float(s)
-                old = bids.get(price, 0.0)
+        for p, s in payload.get("b", []):
+            price = float(p)
+            size = float(s)
+            if size > 0:
+                bids[price] = size
 
-                if size == 0.0:
-                    if old > 0.0:
-                        self.engine.spoof.on_event("bid", price, "cancel", ts)
-                        self.engine.whale[self.symbol].on_event(price, old, "cancel", ts)
-                        bids.pop(price, None)
-                else:
-                    if size > old:
-                        self.engine.spoof.on_event("bid", price, "new", ts)
-                        self.engine.whale[self.symbol].on_event(price, size, "new", ts)
-                    bids[price] = size
+        for p, s in payload.get("a", []):
+            price = float(p)
+            size = float(s)
+            if size > 0:
+                asks[price] = size
 
-            for p, s in payload.get("a", []):
-                price = float(p)
-                size = float(s)
-                old = asks.get(price, 0.0)
+    else:
+        for p, s in payload.get("b", []):
+            price = float(p)
+            size = float(s)
+            old = bids.get(price, 0.0)
 
-                if size == 0.0:
-                    if old > 0.0:
-                        self.engine.spoof.on_event("ask", price, "cancel", ts)
-                        self.engine.whale[self.symbol].on_event(price, old, "cancel", ts)
-                        asks.pop(price, None)
-                else:
-                    if size > old:
-                        self.engine.spoof.on_event("ask", price, "new", ts)
-                        self.engine.whale[self.symbol].on_event(price, size, "new", ts)
-                    asks[price] = size
+            if size == 0.0:
+                if old > 0.0:
+                    self.engine.spoof.on_event("bid", price, "cancel", ts)
+                    self.engine.whale[self.symbol].on_event(price, old, "cancel", ts)
+                    bids.pop(price, None)
+            else:
+                if size > old:
+                    self.engine.spoof.on_event("bid", price, "new", ts)
+                    self.engine.whale[self.symbol].on_event(price, size, "new", ts)
+                bids[price] = size
 
-        self.book["bids"] = {p: s for p, s in bids.items() if s > 0}
-        self.book["asks"] = {p: s for p, s in asks.items() if s > 0}
-        self.last_ob_ts = ts
+        for p, s in payload.get("a", []):
+            price = float(p)
+            size = float(s)
+            old = asks.get(price, 0.0)
+
+            if size == 0.0:
+                if old > 0.0:
+                    self.engine.spoof.on_event("ask", price, "cancel", ts)
+                    self.engine.whale[self.symbol].on_event(price, old, "cancel", ts)
+                    asks.pop(price, None)
+            else:
+                if size > old:
+                    self.engine.spoof.on_event("ask", price, "new", ts)
+                    self.engine.whale[self.symbol].on_event(price, size, "new", ts)
+                asks[price] = size
+
+    self.book["bids"] = {p: s for p, s in bids.items() if s > 0}
+    self.book["asks"] = {p: s for p, s in asks.items() if s > 0}
+    self.last_ob_ts = ts
+
 
     def handle_trades(self, j: Dict[str, Any]) -> None:
         data = j.get("data", [])
