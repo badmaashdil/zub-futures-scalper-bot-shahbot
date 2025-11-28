@@ -787,25 +787,27 @@ class MarketWorker(threading.Thread):
             # Do NOT close WS here – let reconnect loop handle it.
         
 def handle_ob(self, j: Dict[str, Any]) -> None:
-    data = j.get("data", [])
-    if not data:
-        return  # ignore empty messages safely
+        data = j.get("data", [])
+        if not data:
+            return  # ignore empty messages safely
 
-    payload = data[0]
-    typ = j.get("type", "snapshot")
-    ts = now_ts()
+        payload = data[0]
+        typ = j.get("type", "snapshot")
+        ts = now_ts()
 
-    bids = self.book["bids"]
-    asks = self.book["asks"]
+        bids = self.book["bids"]
+        asks = self.book["asks"]
 
         if typ == "snapshot":
             bids.clear()
             asks.clear()
+
             for p, s in payload.get("b", []):
                 price = float(p)
                 size = float(s)
                 if size > 0:
                     bids[price] = size
+
             for p, s in payload.get("a", []):
                 price = float(p)
                 size = float(s)
@@ -817,6 +819,7 @@ def handle_ob(self, j: Dict[str, Any]) -> None:
                 price = float(p)
                 size = float(s)
                 old = bids.get(price, 0.0)
+
                 if size == 0.0:
                     if old > 0.0:
                         self.engine.spoof.on_event("bid", price, "cancel", ts)
@@ -832,6 +835,7 @@ def handle_ob(self, j: Dict[str, Any]) -> None:
                 price = float(p)
                 size = float(s)
                 old = asks.get(price, 0.0)
+
                 if size == 0.0:
                     if old > 0.0:
                         self.engine.spoof.on_event("ask", price, "cancel", ts)
@@ -846,7 +850,7 @@ def handle_ob(self, j: Dict[str, Any]) -> None:
         self.book["bids"] = {p: s for p, s in bids.items() if s > 0}
         self.book["asks"] = {p: s for p, s in asks.items() if s > 0}
         self.last_ob_ts = ts
-
+        
         def handle_trades(self, j: Dict[str, Any]) -> None:
         data = j.get("data", [])
         for t in data:
