@@ -750,7 +750,7 @@ class MarketWorker(threading.Thread):
     def on_error(self, ws, err):
         logger.error(f"{self.symbol}: WebSocket error: {err}")
 
-        def on_message(self, ws, message: str):
+    def on_message(self, ws, message: str):
         try:
             # Mark websocket as alive on every message
             self.last_ws_msg_ts = now_ts()
@@ -766,7 +766,6 @@ class MarketWorker(threading.Thread):
             elif topic.startswith("publicTrade."):
                 self.handle_trades(msg)
 
-            # FIXED INDENTATION HERE ↓↓↓
             now = now_ts()
             if now - self.last_eval >= SCAN_INTERVAL:
                 self.last_eval = now
@@ -775,7 +774,6 @@ class MarketWorker(threading.Thread):
         except Exception as e:
             logger.exception(f"{self.symbol}: exception in on_message: {e}")
             # Do NOT close WS here – let reconnect loop handle it.
-
 
     def handle_ob(self, j: Dict[str, Any]) -> None:
         data = j.get("data", [])
