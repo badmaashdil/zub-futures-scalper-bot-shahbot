@@ -526,8 +526,10 @@ class DecisionEngine:
         pos = self.open_positions.get(symbol)
         if not pos:
             return
+
         del self.open_positions[symbol]
-dist_tp = abs(exit_price - pos.tp_price)
+
+        dist_tp = abs(exit_price - pos.tp_price)
         dist_sl = abs(exit_price - pos.sl_price)
         hit = "TP" if dist_tp < dist_sl else "SL"
 
